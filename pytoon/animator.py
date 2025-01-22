@@ -7,229 +7,177 @@ from datetime import datetime
 import numpy as np
 import cv2
 import copy
-from moviepy.editor import ImageSequenceClip, CompositeVideoClip, CompositeAudioClip, AudioFileClip, VideoClip
+from moviepy.editor import (
+    ImageSequenceClip,
+    CompositeVideoClip,
+    CompositeAudioClip,
+    AudioFileClip,
+    VideoClip,
+    ImageClip
+)
 
 from .util import read_json
 from .dataloader import get_assets
-from .lipsync import viseme_sequencer, upsample
-
+from .lipsync import viseme_sequencer
 
 class FrameSequence:
+    """
+    Armazena a sequência de quadros que compõem a animação da boca,
+    sem mais referências às poses (boneco).
+    """
     def __init__(self):
-        self.pose_files = []
-        self.mouth_files = []
-        self.pose_images = []
-        self.mouth_images = []
-        self.mouth_coords = []
-        self.final_frames = []
-        self.pose_changes = []
+        self.mouth_files = []   # Caminhos (strings) dos arquivos de boca para cada quadro
+        self.final_frames = []  # Imagens finais (np.array RGBA) para cada quadro
 
 
 class animate:
-    """Animates a cartoon that is lip synced to provieded audio voiceover."""
+    """
+    Classe principal para gerar animação de bocas (visemes) sincronizadas com o áudio,
+    sem envolver a pose do personagem.
+    """
 
-    def __init__(self, audio_file: str, transcript: str = None, fps: int = 48):
+    def __init__(self, audio_file: str, transcript: str = None, fps: int = 48, mouth_set_dir="positive"):
+        """
+        - audio_file: caminho para o arquivo de áudio (ex: .wav ou .mp3)
+        - transcript: texto ou caminho de transcrição (opcional, depende de como o lipsync foi implementado)
+        - fps: frames por segundo do vídeo resultante
+        """
+        self.mouth_set_dir = mouth_set_dir  # Diretório de visemes (bocas) a ser utilizado
         self.audio_file = audio_file
-        self.sequence = FrameSequence()
-        self.assets = get_assets()
         self.fps = fps
-        self.final_frames = []
+        
+        # Cria um objeto para armazenar a sequência de frames da boca
+        self.sequence = FrameSequence()
 
-        # Initialize blinking rate (blink every 3 seconds)
-        self.blink_rate = 3.0
+        # (Se ainda precisar de assets por algum motivo, você pode manter.)
+        self.assets = get_assets()  
 
-        # Create sequence of mouth images
-        self.viseme_sequence = viseme_sequencer(self.audio_file, transcript, self.fps)
+        # Gera a sequência de visemas (formas da boca) sincronizadas com o áudio
+        self.viseme_sequence = viseme_sequencer(audio_file, transcript, fps=self.fps)
+
+        # Monta a lista final de arquivos de boca (self.sequence.mouth_files)
         self.build_mouth_sequence()
 
-        self.duration = len(self.sequence.mouth_files) / self.fps
-        print(f"Num Created: {len(self.sequence.mouth_files)}")
-        print(f"Duration: {self.duration}")
+        # Gera cada frame final (apenas a boca em RGBA)
+        self.compile_frames()
 
-        self.build_pose_sequence()
+        # Calcula duração total
+        self.duration = len(self.sequence.mouth_files) / self.fps if self.fps > 0 else 0
 
-        self.frame_size = self.get_frame_size()
-        # Create the animation
-        self.compile_animation()
-
-    def build_pose_sequence(self):
-        """Creates the sequence of pose images for the video"""
-        emotion = self.random_emotion()
-        pose = random.choice(emotion)
-
-        # Add a character pose frame for every frame of a mouth
-        for i, _ in enumerate(self.sequence.mouth_files):
-            if self.sequence.pose_changes[i]:
-                # Change the pose of the character
-                emotion = self.random_emotion()
-                pose = random.choice(emotion)
-
-            eyes = self.blink_manager(idx=i)
-            self.sequence.pose_files.append(pose.image_files[eyes])
-            self.sequence.mouth_coords.append(pose.mouth_coordinates)
-
-        # Prepend absolute path to all pose images
-        self.sequence.pose_files = [f"{os.path.dirname(__file__)}{file}" for file in self.sequence.pose_files]
-
-        # Create mouth PIL image for every frame, with image transformations based on pose
-        for i, _ in enumerate(self.sequence.mouth_files):
-            transformed_image = mouth_transformation(
-                mouth_file=self.sequence.mouth_files[i],
-                mouth_coord=self.sequence.mouth_coords[i],
-            )
-            self.sequence.mouth_images.append(transformed_image)
-        return
-
-    def blink_manager(self, idx):
-
-        BLINK_DURATION = 0.16
-        SUB_BLINKS = ["middle", "shut", "middle"]
-
-        frames_between_blinks = int(self.blink_rate * self.fps)
-        frames_per_blink = int(BLINK_DURATION * self.fps)
-        frames_per_sub_blink = int(frames_per_blink / len(SUB_BLINKS)) + 1
-
-        full_cycle = frames_between_blinks + (frames_per_sub_blink * len(SUB_BLINKS))
-
-        start_1 = frames_between_blinks
-        start_2 = start_1 + frames_per_sub_blink
-        start_3 = start_2 + frames_per_sub_blink
-        end_3 = start_3 + frames_per_sub_blink
-
-        if start_1 <= (idx % full_cycle) < start_2:
-            eyes = "middle"
-
-        elif start_2 <= (idx % full_cycle) < start_3:
-            eyes = "shut"
-
-        elif start_3 <= (idx % full_cycle) < end_3:
-            eyes = "middle"
-
-        else:
-            eyes = "open"
-
-        return eyes
+        
+        print(f"[INFO] Total de frames de boca: {len(self.sequence.mouth_files)}")
+        print(f"[INFO] Duração estimada (s): {self.duration:.2f}")
 
     def build_mouth_sequence(self):
-        """Generates a sequence of mouth images for video"""
-        # Add mouth images to mouth image file sequence
-        for i, _ in enumerate(self.viseme_sequence):
-            if self.viseme_sequence[i].visemes:
-                self.sequence.mouth_files.extend(self.viseme_sequence[i].visemes)
-                pose_changes = [0] * len(self.viseme_sequence[i].visemes)
-                if self.viseme_sequence[i].breath:
-                    pose_changes[0] = 1
-                    self.sequence.pose_changes.extend(pose_changes)
-                else:
-                    self.sequence.pose_changes.extend(pose_changes)
-
-        # Prepend absolute path to mouth images
-        for i, _ in enumerate(self.sequence.mouth_files):
-            file = self.sequence.mouth_files[i]
-            new_file = f"{os.path.dirname(__file__)}/assets/visemes/positive/{file}"
-            self.sequence.mouth_files[i] = new_file
-
-    def random_emotion(self):
-        """Generates a random emotion to use in sequence
-
-        Returns:
-            list[Pose]: List of poses from a random emotion
         """
-        emotions_list = list(self.assets.__dict__.keys())
-        emotion = random.choice(emotions_list)
-        return getattr(self.assets, emotion)
+        Processa a saída do lipsync e monta uma lista de arquivos de boca (visemes)
+        para cada quadro.
+        """
+        for segment in self.viseme_sequence:
+            # Cada 'segment' deve conter .visemes = lista de nomes de arquivo
+            if segment.visemes:
+                # Adiciona todos os nomes de arquivo de boca na sequência
+                self.sequence.mouth_files.extend(segment.visemes)
+        
+        # Prepara o caminho absoluto para cada arquivo de boca
+        # Ex.: /caminho/até/este_arquivo/ + assets/visemes/negative/ + nome_do_arquivo.png
+        base_dir = os.path.dirname(__file__)
+        for i, file_name in enumerate(self.sequence.mouth_files):
+            full_path = os.path.join(base_dir, "assets", "visemes", self.mouth_set_dir, file_name)
+            self.sequence.mouth_files[i] = full_path
 
-    def get_frame_size(self):
-        pose_image = cv2.imread(self.sequence.pose_files[0])
-        height, width, _ = pose_image.shape
-        return (width, height)
+    def compile_frames(self):
+        """
+        Carrega cada arquivo de boca e converte em RGBA (np.array).
+        Aqui você pode aplicar transformações *padrão* (flip, rotate) se quiser,
+        mas, por enquanto, vamos manter o tamanho original.
+        """
+        for mouth_file in self.sequence.mouth_files:
+            # Abre a imagem da boca em RGBA
+            pil_mouth = Image.open(mouth_file).convert("RGBA")
+            
+            # Converte para np.array RGBA
+            mouth_np = np.array(pil_mouth, dtype=np.uint8)
+            
+            # Salva no final_frames (aqui o "frame" é só a boca)
+            self.sequence.final_frames.append(mouth_np)
 
-    def compile_animation(self):
-        for i, _ in enumerate(self.sequence.pose_files):
-            frame = cv2.imread(self.sequence.pose_files[i], cv2.IMREAD_UNCHANGED)
-            if self.sequence.mouth_files[i] is not None:
-                final_frame = render_frame(
-                    pose_img=frame,
-                    mouth_img=self.sequence.mouth_images[i],
-                    mouth_coord=self.sequence.mouth_coords[i],
-                )
-            else:
-                final_frame = frame
-            self.final_frames.append(final_frame)
+    def export(
+        self,
+        path: str,
+        background,
+        mouth_x: int = 0,
+        mouth_y: int = 0,
+        scale_x: float = 1.0,
+        scale_y: float = 1.0
+    ):
+        """
+        Exporta o vídeo final, colando a boca no background, que pode ser:
+          - um objeto VideoClip (video)
+          - ou um caminho para arquivo de imagem (still image).
 
-    def export(self, path: str, background: VideoClip, scale: float = 0.7):
-        animation_clip = ImageSequenceClip(self.final_frames, fps=self.fps, with_mask=True)
-        new_height = int(background.size[1] * scale)
-        new_width = int(animation_clip.w * (new_height / animation_clip.h))
-        animation_clip = animation_clip.resize(width=new_width, height=new_height)
+        :param path: caminho de saída, ex. "output.mp4"
+        :param background: 
+            - se for um VideoClip, usamos diretamente
+            - se for uma string terminando em .png / .jpg, interpretamos como imagem
+        :param mouth_x, mouth_y: coordenadas onde a boca será colada (centro da boca)
+        :param scale_x, scale_y: fatores de escala (1.0 mantém o tamanho original)
+        """
 
-        # Overlay the animation on top of thee background clip
-        final_clip = CompositeVideoClip(
-            clips=[background, animation_clip.set_position(("right", "bottom"))], use_bgclip=True
-        )
+        # 1) Verifica se background é um "VideoClip" ou uma string (caminho da imagem)
+        if isinstance(background, VideoClip):
+            bg_clip = background
+            bg_duration = bg_clip.duration
+        else:
+            # Supondo que seja string de uma imagem
+            if not os.path.isfile(background):
+                raise FileNotFoundError(f"Background image not found: {background}")
+            # Cria um ImageClip com a MESMA duração da animação
+            bg_clip = ImageClip(background).set_duration(self.duration)
+            bg_duration = self.duration
 
-        # Add speech audio to clip with 0.2 second delay
+        # 2) Ajusta a escala da boca em cada frame
+        scaled_frames = []
+        for frame in self.sequence.final_frames:
+            h, w = frame.shape[:2]
+            new_w = int(w * scale_x)
+            new_h = int(h * scale_y)
+            # Evitar dimensões zero ou negativas
+            if new_w < 1: new_w = 1
+            if new_h < 1: new_h = 1
+
+            scaled = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            scaled_frames.append(scaled)
+
+        # 3) Cria o clip de animação (boca) a partir dos frames RGBA
+        mouth_clip = ImageSequenceClip(scaled_frames, fps=self.fps, with_mask=True)
+
+        # Descobre tamanho do 1o frame da boca (depois de escala), para posicionar o centro
+        if scaled_frames:
+            final_h, final_w = scaled_frames[0].shape[:2]
+        else:
+            final_h, final_w = 0, 0
+
+        # Ajuste de posição => (mouth_x, mouth_y) como centro
+        pos_x = mouth_x - (final_w // 2)
+        pos_y = mouth_y - (final_h // 2)
+        mouth_clip = mouth_clip.set_position((pos_x, pos_y))
+
+        # 4) Composição final no MoviePy
+        final_clip = CompositeVideoClip([bg_clip, mouth_clip], use_bgclip=True)
+        final_clip = final_clip.set_duration(min(bg_duration, self.duration))
+
+        # 5) Define o áudio (voz) no final_clip (se você quiser atrasar, use set_start())
         audio_clip = AudioFileClip(self.audio_file)
-        audio_clip = CompositeAudioClip([audio_clip.set_start(0.2)])
-        final_clip = final_clip.set_audio(audio_clip)
+        final_audio = CompositeAudioClip([audio_clip])
+        final_clip = final_clip.set_audio(final_audio)
 
-        # Export video to .mp4
+        # 6) Exporta o resultado
         final_clip.write_videofile(
-            path, codec="libx264", audio_codec="aac", preset="ultrafast", threads=4, fps=self.fps
+            path,
+            codec="libx264",
+            audio_codec="aac",
+            preset="ultrafast",
+            threads=4,
+            fps=self.fps
         )
-
-
-def mouth_transformation(mouth_file, mouth_coord) -> Image:
-    """Transforms mouth image with scaling, flipping, and rotation.
-        This transformation is applied because, the same mouth shape images
-        are used for different pose images, but the size, angle, and position
-        of a mouth image will depend on which pose image is being used.
-
-    Args:
-        mouth_path (str): .png file path pointing to mouth image
-        transformation (np.array): image transformation data for mouth
-
-    Returns:
-        Image: PIL Image object of mouth image with applied transformations
-    """
-    mouth = copy.deepcopy(Image.open(mouth_file))
-    # Flip mouth horizontally if necessary
-    if mouth_coord.flip_x is True:
-        mouth = mouth.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
-    # Scale mouth image if necessary
-    if mouth_coord.scale_y != 1:
-        og_width, og_height = mouth.size
-        new_width = int(abs(og_width * mouth_coord.scale_x))
-        new_height = int(og_height * mouth_coord.scale_y)
-        try:
-            mouth = mouth.resize(new_width, new_height, Image.Resampling.LANCZOS)
-        except:
-            pass
-    # Apply image rotation if necessary
-    if mouth_coord.rotation != 0:
-        mouth = mouth.rotate(-mouth_coord.rotation, resample=Image.Resampling.BICUBIC)
-    return mouth
-
-
-def bgra_to_rgba(image):
-    # Swap blue and red channels
-    b, g, r, a = np.rollaxis(image, axis=-1)
-    return np.dstack([r, g, b, a])
-
-
-def render_frame(pose_img: Image, mouth_img: Image, mouth_coord):
-    pose_img = bgra_to_rgba(pose_img)  # convert to rgba
-    pose_img = Image.fromarray(pose_img)
-    mouth_width, mouth_height = mouth_img.size
-
-    # Location in pose image where mouth / viseme image will be added
-    paste_coordinates = (
-        int(mouth_coord.x - (mouth_width / 2)),
-        int(mouth_coord.y - (mouth_height / 2)),
-    )
-
-    # Paste the mouth image onto the face image at the specified coordinates
-    pose_img.paste(im=mouth_img, box=paste_coordinates, mask=mouth_img)
-    np_image = np.array(pose_img)
-
-    return np_image
